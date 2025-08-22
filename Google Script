@@ -1,0 +1,216 @@
+/***** CONFIG *****/
+const CFG = {
+  // Gmail
+  GMAIL_LABEL: 'MDOT Alerts',      // label your filter applies
+  DEDUPE_LABEL: 'tooted',          // added after a successful toot (prevents repeats)
+  INCLUDE_ARCHIVED: true,          // include archived mail in search
+  RECENCY_DAYS: 7,                 // only consider mail newer than N days (set 0 to disable)
+
+  // Mastodon
+  VISIBILITY: 'public',            // 'public' | 'unlisted' | 'private' | 'direct'
+  HASHTAGS: '#Maine #Traffic',     // appended to the toot (can be empty string)
+  MAX_LEN: 480,                    // keep some headroom under 500
+  TIMEZONE: 'America/New_York',
+
+  // Optional: Content Warning. Leave empty to disable.
+  CONTENT_WARNING: ''              // e.g., 'Traffic Alert'
+};
+
+/***** MAIN SCHEDULED TASK *****/
+function postNewAlertsToMastodon() {
+  const props = PropertiesService.getScriptProperties();
+  const INSTANCE = props.getProperty('MASTO_INSTANCE');
+  const TOKEN = props.getProperty('MASTO_TOKEN');
+  if (!INSTANCE || !TOKEN) {
+    throw new Error('Missing MASTO_INSTANCE or MASTO_TOKEN in Script Properties.');
+  }
+
+  // Ensure dedupe label exists
+  const dedupeLabel = GmailApp.getUserLabelByName(CFG.DEDUPE_LABEL) || GmailApp.createLabel(CFG.DEDUPE_LABEL);
+
+  // Build search query
+  // Example result: label:"MDOT Alerts" -label:"tooted" newer_than:7d in:anywhere
+  let query = `label:"${CFG.GMAIL_LABEL}" -label:"${CFG.DEDUPE_LABEL}"`;
+  if (CFG.RECENCY_DAYS && CFG.RECENCY_DAYS > 0) query += ` newer_than:${CFG.RECENCY_DAYS}d`;
+  if (CFG.INCLUDE_ARCHIVED) query += ` in:anywhere`;
+
+  // Fetch up to 50 threads per run
+  const threads = GmailApp.search(query, 0, 50);
+  console.log(`Found ${threads.length} candidate thread(s) for query: ${query}`);
+
+  threads.forEach(thread => {
+    try {
+      const msg = thread.getMessages().slice(-1)[0]; // latest in thread
+      const subject = (msg.getSubject() || '').trim();
+      const bodyHtml = msg.getBody(); // HTML
+      const text = htmlToText_(bodyHtml);
+
+      // Pull a useful link if there is one
+      const firstUrl = extractFirstUrl_(bodyHtml) || extractFirstUrl_(text);
+
+      // Build toot text
+      let toot = subject;
+      if (firstUrl) toot += `\n${firstUrl}`;
+      if (toot.length < 40) toot += `\n${truncate_(text, 140)}`;
+
+      // Append hashtags
+      const suffix = CFG.HASHTAGS ? `\n${CFG.HASHTAGS}` : '';
+      toot = truncate_(toot, CFG.MAX_LEN - suffix.length) + suffix;
+
+      // Post to Mastodon
+      const ok = tootToMastodon_(INSTANCE, TOKEN, {
+        status: toot,
+        visibility: CFG.VISIBILITY,
+        spoiler_text: CFG.CONTENT_WARNING || undefined
+      });
+
+      if (ok) {
+        // Mark as posted and archive
+        thread.addLabel(dedupeLabel);
+        thread.moveToArchive();
+        console.log(`Tooted & archived thread ${thread.getId()} | "${subject}"`);
+      } else {
+        console.warn(`Failed to toot thread ${thread.getId()} | "${subject}" (see logs above)`);
+      }
+    } catch (e) {
+      console.error('Error processing thread:', thread.getId(), e);
+    }
+  });
+}
+
+/***** MASTODON POSTING *****/
+function tootToMastodon_(instance, token, { status, visibility, spoiler_text }) {
+  if (!status || !status.trim()) {
+    console.warn('Skipping empty status.');
+    return false;
+  }
+  const url = `${instance.replace(/\/$/, '')}/api/v1/statuses`;
+  // application/x-www-form-urlencoded is simplest for Apps Script
+  const payload = {
+    status: status,
+    visibility: visibility || 'public'
+  };
+  if (spoiler_text) payload.spoiler_text = spoiler_text;
+
+  const options = {
+    method: 'post',
+    muteHttpExceptions: true,
+    headers: { Authorization: `Bearer ${token}` },
+    contentType: 'application/x-www-form-urlencoded',
+    payload
+  };
+
+  const res = UrlFetchApp.fetch(url, options);
+  const code = res.getResponseCode();
+  const body = res.getContentText();
+  console.log('Mastodon response:', code, body);
+
+  if (code >= 200 && code < 300) return true;
+
+  // Helpful hints based on status code
+  if (code === 401) console.error('401 Unauthorized: Check token and scopes (needs write:statuses).');
+  if (code === 404) console.error('404 Not Found: Check MASTO_INSTANCE URL.');
+  if (code === 422) console.error('422 Unprocessable Entity: Possibly empty status or invalid visibility.');
+  return false;
+}
+
+/***** DEBUG HELPERS *****/
+
+// 1) Confirm your Mastodon token & instance work
+function testMastodon() {
+  const props = PropertiesService.getScriptProperties();
+  const INSTANCE = props.getProperty('MASTO_INSTANCE');
+  const TOKEN = props.getProperty('MASTO_TOKEN');
+  if (!INSTANCE || !TOKEN) throw new Error('Missing MASTO_INSTANCE or MASTO_TOKEN');
+
+  const status = `Test post from Google Apps Script at ${new Date().toLocaleString('en-US', { timeZone: CFG.TIMEZONE })}`;
+  const ok = tootToMastodon_(INSTANCE, TOKEN, { status, visibility: 'unlisted' });
+  console.log('Mastodon test result:', ok ? 'OK' : 'FAILED');
+}
+
+// 2) See which Gmail threads match your query
+function debugListCandidates() {
+  let q = `label:"${CFG.GMAIL_LABEL}" -label:"${CFG.DEDUPE_LABEL}"`;
+  if (CFG.RECENCY_DAYS && CFG.RECENCY_DAYS > 0) q += ` newer_than:${CFG.RECENCY_DAYS}d`;
+  if (CFG.INCLUDE_ARCHIVED) q += ` in:anywhere`;
+
+  const threads = GmailApp.search(q, 0, 20);
+  console.log('Found threads:', threads.length, 'for query:', q);
+  threads.forEach(t => {
+    const m = t.getMessages().slice(-1)[0];
+    console.log('  •', m.getDate(), '|', m.getSubject(), '| id:', t.getId());
+  });
+}
+
+// 3) Force-post the most recent labeled thread (ignores recency filter)
+function debugForceOne() {
+  let q = `label:"${CFG.GMAIL_LABEL}" -label:"${CFG.DEDUPE_LABEL}" in:anywhere`;
+  const threads = GmailApp.search(q, 0, 1);
+  if (!threads.length) { console.log('No candidate threads.'); return; }
+
+  const thread = threads[0];
+  const msg = thread.getMessages().slice(-1)[0];
+  const subject = (msg.getSubject() || '').trim();
+  const bodyHtml = msg.getBody();
+  const text = htmlToText_(bodyHtml);
+  const firstUrl = extractFirstUrl_(bodyHtml) || extractFirstUrl_(text);
+
+  // Build toot text (no link, more body content)
+	let toot = subject;
+
+	// If the subject is too short or vague, pull more context from the body
+	if (toot.length < 60) {
+	  toot += `\n${truncate_(text, 400)}`;
+	} else {
+ 	 // Use up to 400 chars of the body regardless, for richer info
+  	toot += `\n\n${truncate_(text, 400)}`;
+	}
+
+// Append hashtags if configured
+const suffix = CFG.HASHTAGS ? `\n${CFG.HASHTAGS}` : '';
+toot = truncate_(toot, CFG.MAX_LEN - suffix.length) + suffix;
+
+  const props = PropertiesService.getScriptProperties();
+  const ok = tootToMastodon_(props.getProperty('MASTO_INSTANCE'), props.getProperty('MASTO_TOKEN'), {
+    status: toot,
+    visibility: CFG.VISIBILITY,
+    spoiler_text: CFG.CONTENT_WARNING || undefined
+  });
+
+  console.log('Forced toot result:', ok ? 'OK' : 'FAILED');
+  if (ok) {
+    const dedupeLabel = GmailApp.getUserLabelByName(CFG.DEDUPE_LABEL) || GmailApp.createLabel(CFG.DEDUPE_LABEL);
+    thread.addLabel(dedupeLabel);
+    thread.moveToArchive();
+    console.log(`Marked & archived thread ${thread.getId()} | "${subject}"`);
+  }
+}
+
+/***** UTILITIES *****/
+function htmlToText_(html) {
+  if (!html) return '';
+  let t = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/\r?\n[\s\u00A0]*/g, '\n')
+    .replace(/[ \t]{2,}/g, ' ');
+  return t.trim();
+}
+
+function extractFirstUrl_(s) {
+  if (!s) return '';
+  const m = s.match(/\bhttps?:\/\/[^\s<>"')]+/i);
+  return m ? m[0] : '';
+}
+
+function truncate_(s, n) {
+  if (!s) return '';
+  return s.length <= n ? s : s.slice(0, Math.max(0, n - 1)) + '…';
+}
